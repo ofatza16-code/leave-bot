@@ -48,8 +48,11 @@ async function handler(req, res) {
     if (req.method !== 'POST') {
       const miss = missingEnv();
       let libs = 'ok';
-      try { loadLibs(); } catch (e) { libs = 'ERROR ' + String(e.message).split('\n')[0]; }
-      return res.status(200).send(`ok | ตัวแปรที่ขาด: ${miss.length ? miss.join(', ') : 'ไม่มี'} | ไฟล์ lib: ${libs}`);
+      let key = '-';
+      try { key = loadLibs().sheets.checkKey(); } catch (e) { libs = 'ERROR ' + String(e.message).split('\n')[0]; }
+      return res.status(200).send(
+        `ok | ตัวแปรที่ขาด: ${miss.length ? miss.join(', ') : 'ไม่มี'} | ไฟล์ lib: ${libs} | GOOGLE_PRIVATE_KEY: ${key}`
+      );
     }
 
     const body = await rawBody(req);
