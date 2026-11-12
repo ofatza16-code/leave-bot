@@ -1,30 +1,81 @@
-const line = require('@line/bot-sdk');
-const { parseLeave, sanitize } = require('../lib/parse');
-const { fmt, nowStamp, todayISO, thDate } = require('../lib/dates');
-const { readLeaves, appendLeave, findEmployee, bindLineUser, readQuota } = require('../lib/sheets');
-const { buildDailySummary } = require('../lib/summary');
+const crypto = require('crypto');
 
-const lineClient = new line.messagingApi.MessagingApiClient({
-  channelAccessToken: process.env.LINE_TOKEN,
-});
+// ---------- ตัวช่วยพื้นฐาน (ไม่พึ่งไฟล์อื่น เพื่อให้ Verify ผ่านได้เสมอ) ----------
+const REQUIRED = ['LINE_TOKEN', 'LINE_SECRET', 'GOOGLE_CLIENT_EMAIL', 'GOOGLE_PRIVATE_KEY', 'SHEET_ID'];
+const missingEnv = () => REQUIRED.filter((k) => !process.env[k] || !String(process.env[k]).trim());
+
+// โหลดไฟล์ใน lib/ ตอนใช้งานจริงเท่านั้น ถ้าขาดจะรู้จาก log แทนที่จะพังทั้งระบบ
+function loadLibs() {
+  return {
+    parse: require('../lib/parse'),
+    dates: require('../lib/dates'),
+    sheets: require('../lib/sheets'),
+    summary: require('../lib/summary'),
+  };
+}
 
 async function rawBody(req) {
   const chunks = [];
-  for await (const c of req) chunks.push(c);
-  return Buffer.concat(chunks);
+  for await (const c of req) chunks.push(typeof c === 'string' ? Buffer.from(c) : c);
+  let buf = Buffer.concat(chunks);
+  if (!buf.length) {
+    try {
+      if (req.body) buf = Buffer.from(typeof req.body === 'string' ? req.body : JSON.stringify(req.body));
+    } catch (_) { /* ไม่มี body */ }
+  }
+  return buf;
 }
 
+function validSignature(body, secret, signature) {
+  const mac = Buffer.from(crypto.createHmac('sha256', secret).update(body).digest('base64'));
+  const given = Buffer.from(String(signature || ''));
+  return mac.length === given.length && crypto.timingSafeEqual(mac, given);
+}
+
+async function lineReply(replyToken, text) {
+  const r = await fetch('https://api.line.me/v2/bot/message/reply', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.LINE_TOKEN}` },
+    body: JSON.stringify({ replyToken, messages: [{ type: 'text', text }] }),
+  });
+  if (!r.ok) console.error('LINE reply failed', r.status, await r.text());
+}
+
+// ---------- ตัวรับ Webhook ----------
 async function handler(req, res) {
-  if (req.method !== 'POST') return res.status(200).send('ok');
-  const body = await rawBody(req);
-  const sig = req.headers['x-line-signature'];
-  if (!sig || !line.validateSignature(body, process.env.LINE_SECRET, sig)) {
-    return res.status(401).end();
+  try {
+    // เปิดในเบราว์เซอร์: ตรวจสถานะระบบ (แสดงเฉพาะชื่อตัวแปร ไม่แสดงค่า)
+    if (req.method !== 'POST') {
+      const miss = missingEnv();
+      let libs = 'ok';
+      try { loadLibs(); } catch (e) { libs = 'ERROR ' + String(e.message).split('\n')[0]; }
+      return res.status(200).send(`ok | ตัวแปรที่ขาด: ${miss.length ? miss.join(', ') : 'ไม่มี'} | ไฟล์ lib: ${libs}`);
+    }
+
+    const body = await rawBody(req);
+    let events = [];
+    try { events = JSON.parse(body.toString() || '{}').events || []; } catch (_) { /* ไม่ใช่ JSON */ }
+
+    // ปุ่ม Verify ของ LINE ส่ง events ว่างมา: ตอบ 200 ได้เลย
+    if (!events.length) return res.status(200).send('ok');
+
+    const secret = process.env.LINE_SECRET;
+    if (!secret) {
+      console.error('MISSING ENV: LINE_SECRET (ตั้งใน Vercel > Settings > Environment Variables แล้ว Redeploy)');
+      return res.status(500).send('missing LINE_SECRET');
+    }
+    if (!validSignature(body, secret, req.headers['x-line-signature'])) {
+      console.error('Invalid signature: LINE_SECRET ใน Vercel ไม่ตรงกับ Channel secret ของไลน์');
+      return res.status(401).end();
+    }
+
+    // ต้องตอบ 200 เสมอเมื่อลายเซ็นถูก ไม่งั้น LINE จะส่งซ้ำ
+    await Promise.allSettled(events.map(handle));
+    return res.status(200).end();
+  } catch (err) {
+    console.error('webhook error', err);
+    return res.status(500).send('error');
   }
-  const events = JSON.parse(body.toString()).events || [];
-  // ต้องตอบ 200 เสมอ ไม่งั้น LINE จะส่ง event ซ้ำ
-  await Promise.allSettled(events.map(handle));
-  res.status(200).end();
 }
 
 async function handle(ev) {
@@ -33,8 +84,7 @@ async function handle(ev) {
     if (ev.source.type !== 'group') return;
 
     const text = ev.message.text.trim();
-    const reply = (t) =>
-      lineClient.replyMessage({ replyToken: ev.replyToken, messages: [{ type: 'text', text: t }] });
+    const reply = (t) => lineReply(ev.replyToken, t);
 
     // ช่วยตอนตั้งค่า: ขอ Group ID (ตอบเฉพาะตอนที่ยังไม่ได้ตั้ง LINE_GROUP_ID)
     if (text === '/groupid' && !process.env.LINE_GROUP_ID) {
@@ -43,10 +93,16 @@ async function handle(ev) {
     // รับคำสั่งเฉพาะกลุ่มที่กำหนด
     if (process.env.LINE_GROUP_ID && ev.source.groupId !== process.env.LINE_GROUP_ID) return;
 
+    if (text !== 'สรุปวันนี้' && !text.startsWith('ลา')) return;
+
+    const { parse, dates, sheets, summary } = loadLibs();
+    const { fmt, nowStamp, todayISO, thDate } = dates;
+    const { parseLeave, sanitize } = parse;
+    const { readLeaves, appendLeave, findEmployee, bindLineUser, readQuota } = sheets;
+
     if (text === 'สรุปวันนี้') {
-      return reply(buildDailySummary(await readLeaves(), todayISO()));
+      return reply(summary.buildDailySummary(await readLeaves(), todayISO()));
     }
-    if (!text.startsWith('ลา')) return;
 
     const leave = parseLeave(text);
     if (leave.error === 'format') {
@@ -109,10 +165,7 @@ async function handle(ev) {
   } catch (err) {
     console.error('handle error', err);
     try {
-      await lineClient.replyMessage({
-        replyToken: ev.replyToken,
-        messages: [{ type: 'text', text: '⚠️ ระบบขัดข้อง บันทึกไม่สำเร็จ กรุณาลองใหม่หรือแจ้งแอดมิน' }],
-      });
+      await lineReply(ev.replyToken, '⚠️ ระบบขัดข้อง บันทึกไม่สำเร็จ กรุณาลองใหม่หรือแจ้งแอดมิน');
     } catch (_) { /* replyToken อาจหมดอายุ */ }
   }
 }
