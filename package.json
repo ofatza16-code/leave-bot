@@ -1,0 +1,12 @@
+{
+  "name": "leave-bot",
+  "version": "1.0.0",
+  "description": "LINE group leave-reporting bot: records to Google Sheet, replies with summary, daily summary via cron",
+  "private": true,
+  "engines": { "node": ">=18" },
+  "scripts": { "test": "node test/run.js" },
+  "dependencies": {
+    "@line/bot-sdk": "^9.0.0",
+    "googleapis": "^140.0.0"
+  }
+}
